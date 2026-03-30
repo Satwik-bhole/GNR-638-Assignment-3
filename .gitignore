@@ -1,0 +1,31 @@
+# Dataset directories
+data/
+data/VOCdevkit/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment directories
+venv/
+.venv/
+env/
+.env/
+
+# IDE/Editor directories
+.vscode/
+.idea/
+
+# Images/Outputs
+comparison_plots.png
+*.jpg
+*.png
+
+# Weights and Checkpoints
+*.pth
+*.pt
+*.ckpt
+
+# Output logs
+*.log

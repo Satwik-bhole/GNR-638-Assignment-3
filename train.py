@@ -1,152 +1,466 @@
+"""
+Training script for PSPNet — scratch vs. official (SMP library) comparison.
+
+This script:
+  1. Trains our from-scratch PSPNet on a toy PASCAL VOC 2012 subset
+  2. Trains the segmentation-models-pytorch (SMP) PSPNet on the same data
+  3. Computes loss, pixel accuracy, and mean IoU for both
+  4. Generates comparison plots and a qualitative side-by-side visualization
+  5. Prints a final metrics summary table
+
+Training follows the paper's recommendations where practical:
+  - SGD with momentum 0.9 and weight decay 1e-4
+  - Poly learning rate schedule: lr = base_lr * (1 - iter/max_iter)^0.9
+  - 10x learning rate for newly added heads vs. the pretrained backbone
+  - Auxiliary loss weight of 0.4
+  - Cross-entropy with ignore_index=255
+"""
+
+import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")  # non-interactive backend so it works on servers
+import matplotlib.pyplot as plt
 import segmentation_models_pytorch as smp
-from dataset import get_dataloaders
+
+from dataset import get_dataloaders, IGNORE_LABEL, VOC_NUM_CLASSES
 from pspnet_scratch import PSPNetScratch
 from tqdm import tqdm
-import os
-import matplotlib.pyplot as plt
 
-def plot_comparison(history_scratch, history_official, epochs):
-    epochs_range = range(1, epochs + 1)
-    
-    plt.figure(figsize=(18, 5))
-    
-    # Train Loss
-    plt.subplot(1, 3, 1)
-    plt.plot(epochs_range, history_scratch['train_loss'], marker='o', label='Scratch PSPNet')
-    plt.plot(epochs_range, history_official['train_loss'], marker='o', label='Official PSPNet')
-    plt.title('Training Loss Comparison')
-    plt.xlabel('Epochs')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.grid(True)
-    
-    # Val Loss
-    plt.subplot(1, 3, 2)
-    plt.plot(epochs_range, history_scratch['val_loss'], marker='o', label='Scratch PSPNet')
-    plt.plot(epochs_range, history_official['val_loss'], marker='o', label='Official PSPNet')
-    plt.title('Validation Loss Comparison')
-    plt.xlabel('Epochs')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.grid(True)
-    
-    # Val Accuracy
-    plt.subplot(1, 3, 3)
-    plt.plot(epochs_range, history_scratch['val_acc'], marker='o', label='Scratch PSPNet')
-    plt.plot(epochs_range, history_official['val_acc'], marker='o', label='Official PSPNet')
-    plt.title('Validation Pixel Accuracy Comparison')
-    plt.xlabel('Epochs')
-    plt.ylabel('Accuracy')
-    plt.legend()
-    plt.grid(True)
-    
-    plt.tight_layout()
-    plt.savefig('comparison_plots.png')
-    print("\nSaved comparison plots to 'comparison_plots.png'")
 
-def train_model(model, train_loader, val_loader, epochs=5, lr=0.001, device='cpu', name='model'):
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+def compute_miou(preds, targets, num_classes, ignore_index=255):
+    """
+    Compute per-class IoU and return the mean (mIoU).
+
+    mIoU is the primary metric used in the PSPNet paper. For each class we
+    calculate intersection / union, then average across classes that actually
+    appear in the batch.
+    """
+    ious = []
+    preds = preds.view(-1)
+    targets = targets.view(-1)
+
+    # mask out ignore pixels
+    valid = targets != ignore_index
+    preds = preds[valid]
+    targets = targets[valid]
+
+    for cls in range(num_classes):
+        pred_mask = (preds == cls)
+        target_mask = (targets == cls)
+        intersection = (pred_mask & target_mask).sum().item()
+        union = (pred_mask | target_mask).sum().item()
+        if union > 0:
+            ious.append(intersection / union)
+
+    return np.mean(ious) if ious else 0.0
+
+
+def compute_pixel_accuracy(preds, targets, ignore_index=255):
+    """
+    Overall pixel accuracy (aAcc) — fraction of correctly classified pixels,
+    excluding ignored pixels.
+    """
+    valid = targets != ignore_index
+    correct = (preds[valid] == targets[valid]).sum().item()
+    total = valid.sum().item()
+    return correct / total if total > 0 else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Poly learning rate schedule (from the paper)
+# ---------------------------------------------------------------------------
+
+def make_poly_scheduler(optimizer, total_iters, power=0.9):
+    """
+    Build a poly-decay LR scheduler via LambdaLR.
+
+    The paper decays the learning rate as:
+        lr = base_lr * (1 - current_iter / total_iters) ^ power
+    with power = 0.9.  Using LambdaLR keeps things simple.
+    """
+    def _poly_lambda(current_step):
+        return (1.0 - current_step / total_iters) ** power
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_poly_lambda)
+
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+
+def train_model(model, train_loader, val_loader, epochs=10, base_lr=0.01,
+                device="cpu", name="model", is_scratch=False):
+    """
+    Train a segmentation model and track loss, pixel accuracy, and mIoU.
+
+    For the scratch model we use:
+      - SGD with momentum and weight decay (matching the paper)
+      - Differential learning rates: backbone at base_lr, heads at 10x
+      - Poly LR decay
+      - Auxiliary loss weighted at 0.4
+
+    For the SMP baseline we use the same optimizer settings for fair comparison.
+    """
     model = model.to(device)
-    criterion = nn.CrossEntropyLoss(ignore_index=255)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss(ignore_index=IGNORE_LABEL)
 
-    history = {'train_loss': [], 'val_loss': [], 'val_acc': []}
+    # separate the pretrained backbone parameters from the freshly-initialised
+    # heads — the paper trains heads at 10x the backbone learning rate
+    if is_scratch:
+        new_layer_keywords = ["pyramid_pool", "seg_head", "aux_head",
+                               "stem", "stem_adapter"]
+        backbone_params, head_params = [], []
+        for pname, p in model.named_parameters():
+            if any(kw in pname for kw in new_layer_keywords):
+                head_params.append(p)
+            else:
+                backbone_params.append(p)
+        param_groups = [
+            {"params": backbone_params, "lr": base_lr},
+            {"params": head_params,     "lr": base_lr * 10},
+        ]
+    else:
+        param_groups = [{"params": model.parameters(), "lr": base_lr}]
 
-    print(f"\\n--- Training {name} ---")
+    # the paper uses SGD with momentum and L2 regularisation
+    optimizer = optim.SGD(param_groups, momentum=0.9, weight_decay=1e-4)
+
+    # smooth poly-decay schedule over the entire training run
+    total_iters = epochs * len(train_loader)
+    scheduler = make_poly_scheduler(optimizer, total_iters, power=0.9)
+
+    history = {"train_loss": [], "val_loss": [], "val_acc": [], "val_miou": []}
+
+    print(f"\n{'='*60}")
+    print(f"  Training: {name}")
+    print(f"  Epochs: {epochs}  |  LR: {base_lr}  |  Device: {device}")
+    print(f"{'='*60}")
+
     for epoch in range(epochs):
+        # ---- training phase ----
         model.train()
-        train_loss = 0.0
-        
-        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")
-        for images, masks in train_pbar:
+        running_loss = 0.0
+
+        pbar = tqdm(train_loader, desc=f"[{name}] Epoch {epoch+1}/{epochs} Train")
+        for images, masks in pbar:
             images, masks = images.to(device), masks.to(device)
+
             optimizer.zero_grad()
             outputs = model(images)
-            
-            # Handle auxiliary outputs for scratch implementation
+
+            # handle auxiliary output from our scratch model
             if isinstance(outputs, tuple):
                 main_out, aux_out = outputs
-                loss1 = criterion(main_out, masks)
-                loss2 = criterion(aux_out, masks)
-                loss = loss1 + 0.4 * loss2  # Paper sets aux weight to 0.4
+                loss = criterion(main_out, masks) + 0.4 * criterion(aux_out, masks)
             else:
                 loss = criterion(outputs, masks)
-                
+
             loss.backward()
             optimizer.step()
-            train_loss += loss.item()
-            train_pbar.set_postfix({'loss': f"{loss.item():.4f}"})
-            
-        train_loss /= len(train_loader)
-        
-        # Validation
+            scheduler.step()
+
+            running_loss += loss.item()
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+        avg_train_loss = running_loss / len(train_loader)
+
+        # ---- validation phase ----
         model.eval()
-        val_loss = 0.0
-        correct, total = 0, 0
-        
-        val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]")
+        val_loss_sum = 0.0
+        all_preds, all_targets = [], []
+
         with torch.no_grad():
-            for images, masks in val_pbar:
+            for images, masks in val_loader:
                 images, masks = images.to(device), masks.to(device)
                 outputs = model(images)
-                loss = criterion(outputs, masks)
-                val_loss += loss.item()
-                
-                # Accuracy calculation
+                val_loss_sum += criterion(outputs, masks).item()
+
                 preds = torch.argmax(outputs, dim=1)
-                mask_valid = (masks != 255)
-                correct += (preds[mask_valid] == masks[mask_valid]).sum().item()
-                total += mask_valid.sum().item()
-                val_pbar.set_postfix({'loss': f"{loss.item():.4f}"})
-        
-        val_loss /= len(val_loader)
-        val_acc = correct / total if total > 0 else 0
-        
-        history['train_loss'].append(train_loss)
-        history['val_loss'].append(val_loss)
-        history['val_acc'].append(val_acc)
-        
-        print(f"Epoch {epoch+1}/{epochs} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Pixel Acc: {val_acc:.4f}")
+                all_preds.append(preds.cpu())
+                all_targets.append(masks.cpu())
+
+        avg_val_loss = val_loss_sum / len(val_loader)
+        all_preds = torch.cat(all_preds)
+        all_targets = torch.cat(all_targets)
+        val_acc = compute_pixel_accuracy(all_preds, all_targets, IGNORE_LABEL)
+        val_miou = compute_miou(all_preds, all_targets, VOC_NUM_CLASSES, IGNORE_LABEL)
+
+        history["train_loss"].append(avg_train_loss)
+        history["val_loss"].append(avg_val_loss)
+        history["val_acc"].append(val_acc)
+        history["val_miou"].append(val_miou)
+
+        print(f"  Epoch {epoch+1}/{epochs}  "
+              f"Train Loss: {avg_train_loss:.4f}  |  "
+              f"Val Loss: {avg_val_loss:.4f}  |  "
+              f"Pixel Acc: {val_acc:.4f}  |  "
+              f"mIoU: {val_miou:.4f}")
 
     return model, history
 
 
+# ---------------------------------------------------------------------------
+# Plotting
+# ---------------------------------------------------------------------------
+
+def plot_comparison(hist_scratch, hist_official, epochs, save_path="comparison_plots.png"):
+    """
+    Generate a 2x2 grid comparing scratch vs. official PSPNet:
+      - Training loss
+      - Validation loss
+      - Pixel accuracy
+      - Mean IoU (the paper's primary metric)
+    """
+    ep = range(1, epochs + 1)
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    titles = ["Training Loss", "Validation Loss", "Pixel Accuracy", "Mean IoU"]
+    keys = ["train_loss", "val_loss", "val_acc", "val_miou"]
+    ylabels = ["Loss", "Loss", "Accuracy", "mIoU"]
+
+    for ax, title, key, ylabel in zip(axes.flat, titles, keys, ylabels):
+        ax.plot(ep, hist_scratch[key], "o-", label="Scratch PSPNet", linewidth=2)
+        ax.plot(ep, hist_official[key], "s--", label="Official (SMP) PSPNet", linewidth=2)
+        ax.set_title(title, fontsize=13)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(ylabel)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+    fig.suptitle("PSPNet: Scratch vs Official Implementation Comparison",
+                 fontsize=15, fontweight="bold", y=1.01)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    print(f"\nSaved comparison plots to '{save_path}'")
+    plt.close()
+
+
+def visualize_predictions(model_scratch, model_official, val_loader, device,
+                          num_samples=4, save_path="qualitative_results.png"):
+    """
+    Show a side-by-side comparison of predictions from both models on a few
+    validation images: [Input | Ground Truth | Scratch Pred | Official Pred]
+    """
+    model_scratch.eval()
+    model_official.eval()
+
+    # grab one batch
+    images, masks = next(iter(val_loader))
+    images_dev = images.to(device)
+    num_samples = min(num_samples, images.size(0))
+
+    with torch.no_grad():
+        pred_scratch = torch.argmax(model_scratch(images_dev), dim=1).cpu()
+        pred_official = torch.argmax(model_official(images_dev), dim=1).cpu()
+
+    # un-normalize the images for display
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+    fig, axes = plt.subplots(num_samples, 4, figsize=(16, 4 * num_samples))
+    col_titles = ["Input Image", "Ground Truth", "Scratch PSPNet", "Official (SMP)"]
+
+    for i in range(num_samples):
+        img = images[i] * std + mean
+        img = img.permute(1, 2, 0).clamp(0, 1).numpy()
+
+        gt = masks[i].numpy()
+        s_pred = pred_scratch[i].numpy()
+        o_pred = pred_official[i].numpy()
+
+        axes[i, 0].imshow(img)
+        axes[i, 1].imshow(gt, cmap="tab20", vmin=0, vmax=20)
+        axes[i, 2].imshow(s_pred, cmap="tab20", vmin=0, vmax=20)
+        axes[i, 3].imshow(o_pred, cmap="tab20", vmin=0, vmax=20)
+
+        for j in range(4):
+            axes[i, j].axis("off")
+            if i == 0:
+                axes[i, j].set_title(col_titles[j], fontsize=12)
+
+    fig.suptitle("Qualitative Comparison: Scratch vs Official PSPNet",
+                 fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    print(f"Saved qualitative results to '{save_path}'")
+    plt.close()
+
+
+# ---------------------------------------------------------------------------
+# Multi-scale inference (paper uses scales [0.5, 0.75, 1.0, 1.25, 1.5, 1.75])
+# ---------------------------------------------------------------------------
+
+def multiscale_predict(model, image_batch, num_classes, device,
+                       scales=(0.75, 1.0, 1.25), flip=True):
+    """
+    Average predictions across multiple scales (and optional horizontal flip)
+    to boost accuracy at test time, as described in the paper.
+    """
+    model.eval()
+    B, C, H, W = image_batch.shape
+    total_logits = torch.zeros(B, num_classes, H, W, device=device)
+
+    with torch.no_grad():
+        for s in scales:
+            sh, sw = int(H * s), int(W * s)
+            scaled = F.interpolate(image_batch, size=(sh, sw),
+                                   mode="bilinear", align_corners=True)
+            out = model(scaled)
+            out = F.interpolate(out, size=(H, W),
+                                mode="bilinear", align_corners=True)
+            total_logits += out
+
+            if flip:
+                # horizontal flip
+                flipped = torch.flip(scaled, dims=[3])
+                out_f = model(flipped)
+                out_f = torch.flip(out_f, dims=[3])
+                out_f = F.interpolate(out_f, size=(H, W),
+                                      mode="bilinear", align_corners=True)
+                total_logits += out_f
+
+    return torch.argmax(total_logits, dim=1)
+
+
+def evaluate_with_multiscale(model, val_loader, device, num_classes):
+    """
+    Run multi-scale inference on the whole val set and return pixel acc + mIoU.
+    """
+    model.eval()
+    all_preds, all_targets = [], []
+    for images, masks in val_loader:
+        images = images.to(device)
+        preds = multiscale_predict(model, images, num_classes, device).cpu()
+        all_preds.append(preds)
+        all_targets.append(masks)
+
+    all_preds = torch.cat(all_preds)
+    all_targets = torch.cat(all_targets)
+    acc = compute_pixel_accuracy(all_preds, all_targets, IGNORE_LABEL)
+    miou = compute_miou(all_preds, all_targets, num_classes, IGNORE_LABEL)
+    return acc, miou
+
+
+def print_summary_table(hist_scratch, hist_official,
+                        ms_scratch=None, ms_official=None):
+    """Print a clean comparison table of final-epoch metrics."""
+    print("\n" + "=" * 65)
+    print("  FINAL METRICS COMPARISON (last epoch)")
+    print("=" * 65)
+    header = f"  {'Metric':<22} {'Scratch PSPNet':>18} {'Official (SMP)':>18}"
+    print(header)
+    print("-" * 65)
+
+    metrics = [
+        ("Train Loss",  "train_loss"),
+        ("Val Loss",    "val_loss"),
+        ("Pixel Accuracy", "val_acc"),
+        ("Mean IoU",    "val_miou"),
+    ]
+    for label, key in metrics:
+        s = hist_scratch[key][-1]
+        o = hist_official[key][-1]
+        print(f"  {label:<22} {s:>18.4f} {o:>18.4f}")
+
+    if ms_scratch and ms_official:
+        print("-" * 65)
+        print(f"  {'MS Pixel Accuracy':<22} {ms_scratch[0]:>18.4f} {ms_official[0]:>18.4f}")
+        print(f"  {'MS Mean IoU':<22} {ms_scratch[1]:>18.4f} {ms_official[1]:>18.4f}")
+
+    print("=" * 65)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    
-    # Configuration
-    epochs = 5
-    batch_size = 4
-    num_train = 600  # Toy dataset size
-    num_val = 200
-    num_classes = 21
 
-    # Dataloaders - Downloads VOC if needed
-    print("\\nPreparing datasets and dataloaders...")
-    train_loader, val_loader = get_dataloaders('./data', batch_size=batch_size, num_train=num_train, num_val=num_val)
-    print(f"Loaded {len(train_loader.dataset)} training samples and {len(val_loader.dataset)} validation samples.")
+    # --- hyperparameters (scaled for RTX 3050 6GB VRAM) ---
+    epochs = 15
+    batch_size = 2        # 6GB GPU can't handle larger batches at this resolution
+    base_lr = 0.01        # paper uses 0.01 as the base learning rate
+    num_train = 500       # subset of VOC
+    num_val = 100
+    crop_size = 256       # 473 OOMs on 6GB; 256 fits comfortably
+    num_classes = VOC_NUM_CLASSES  # 21 for PASCAL VOC
 
-    # 1. Scratch Implementation
-    print("\\n\\nInitializing Scratch PSPNet with Auxiliary Branch (0.4 loss weight)...")
-    model_scratch = PSPNetScratch(num_classes=num_classes, use_aux=True)
-    _, history_scratch = train_model(model_scratch, train_loader, val_loader, epochs=epochs, device=device, name="Scratch_PSPNet")
-
-    # 2. Official/Standard Library Implementation (using SMP)
-    print("\\n\\nInitializing Official/SMP PSPNet...")
-    model_official = smp.PSPNet(
-        encoder_name="resnet50",        # backbone architecture
-        encoder_weights="imagenet",     # pre-trained weights
-        in_channels=3,
-        classes=num_classes,            # output classes
+    # --- prepare data ---
+    print("\nPreparing datasets (will download VOC 2012 on first run)...")
+    train_loader, val_loader = get_dataloaders(
+        root="./data", batch_size=batch_size,
+        num_train=num_train, num_val=num_val, crop_size=crop_size,
     )
-    _, history_official = train_model(model_official, train_loader, val_loader, epochs=epochs, device=device, name="Official_PSPNet")
+    print(f"Train: {len(train_loader.dataset)} images ({len(train_loader)} batches)")
+    print(f"Val  : {len(val_loader.dataset)} images ({len(val_loader)} batches)")
 
-    # 3. Generate Comparison Plots
-    print("\\nGenerating comparison plot...")
-    plot_comparison(history_scratch, history_official, epochs)
+    # ------------------------------------------------------------------
+    # 1. Train scratch PSPNet (our implementation with auxiliary loss)
+    # ------------------------------------------------------------------
+    print("\n>>> Initializing Scratch PSPNet with auxiliary branch...")
+    model_scratch = PSPNetScratch(num_classes=num_classes, use_aux=True)
+    model_scratch, hist_scratch = train_model(
+        model_scratch, train_loader, val_loader,
+        epochs=epochs, base_lr=base_lr, device=device,
+        name="Scratch PSPNet", is_scratch=True,
+    )
 
-if __name__ == '__main__':
+    # ------------------------------------------------------------------
+    # 2. Train official PSPNet from segmentation-models-pytorch (SMP)
+    # ------------------------------------------------------------------
+    print("\n>>> Initializing Official (SMP) PSPNet...")
+    model_official = smp.PSPNet(
+        encoder_name="resnet50",
+        encoder_weights="imagenet",
+        in_channels=3,
+        classes=num_classes,
+    )
+    model_official, hist_official = train_model(
+        model_official, train_loader, val_loader,
+        epochs=epochs, base_lr=base_lr, device=device,
+        name="Official (SMP) PSPNet", is_scratch=False,
+    )
+
+    # ------------------------------------------------------------------
+    # 3. Multi-scale inference (paper evaluates at multiple scales)
+    # ------------------------------------------------------------------
+    print("\n>>> Running multi-scale inference (scales: 0.5–1.75 + flip)...")
+    ms_scratch = evaluate_with_multiscale(
+        model_scratch, val_loader, device, num_classes)
+    print(f"  Scratch  MS — Pixel Acc: {ms_scratch[0]:.4f}, mIoU: {ms_scratch[1]:.4f}")
+
+    ms_official = evaluate_with_multiscale(
+        model_official, val_loader, device, num_classes)
+    print(f"  Official MS — Pixel Acc: {ms_official[0]:.4f}, mIoU: {ms_official[1]:.4f}")
+
+    # ------------------------------------------------------------------
+    # 4. Comparison outputs
+    # ------------------------------------------------------------------
+    print("\n>>> Generating comparison plots...")
+    plot_comparison(hist_scratch, hist_official, epochs)
+
+    print("\n>>> Generating qualitative predictions...")
+    visualize_predictions(model_scratch, model_official, val_loader, device)
+
+    print_summary_table(hist_scratch, hist_official, ms_scratch, ms_official)
+
+    # save trained weights so results are reproducible
+    os.makedirs("checkpoints", exist_ok=True)
+    torch.save(model_scratch.state_dict(), "checkpoints/pspnet_scratch.pth")
+    torch.save(model_official.state_dict(), "checkpoints/pspnet_official.pth")
+    print("\nSaved model checkpoints to 'checkpoints/'")
+
+
+if __name__ == "__main__":
     main()

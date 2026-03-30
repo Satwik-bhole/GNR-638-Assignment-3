@@ -3,4 +3,5 @@ torchvision
 numpy
 matplotlib
 tqdm
+Pillow
 segmentation-models-pytorch
