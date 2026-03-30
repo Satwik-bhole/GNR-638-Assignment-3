@@ -17,10 +17,6 @@ env/
 .vscode/
 .idea/
 
-# Images/Outputs
-comparison_plots.png
-*.jpg
-*.png
 
 # Weights and Checkpoints
 *.pth
