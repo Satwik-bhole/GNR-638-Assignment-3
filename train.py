@@ -1,19 +1,6 @@
 """
-Training script for PSPNet — scratch vs. official (SMP library) comparison.
-
-This script:
-  1. Trains our from-scratch PSPNet on a toy PASCAL VOC 2012 subset
-  2. Trains the segmentation-models-pytorch (SMP) PSPNet on the same data
-  3. Computes loss, pixel accuracy, and mean IoU for both
-  4. Generates comparison plots and a qualitative side-by-side visualization
-  5. Prints a final metrics summary table
-
-Training follows the paper's recommendations where practical:
-  - SGD with momentum 0.9 and weight decay 1e-4
-  - Poly learning rate schedule: lr = base_lr * (1 - iter/max_iter)^0.9
-  - 10x learning rate for newly added heads vs. the pretrained backbone
-  - Auxiliary loss weight of 0.4
-  - Cross-entropy with ignore_index=255
+Compare our custom PSPNet against hszhao's official implementation.
+Trains both on a subset of VOC and plots the results.
 """
 
 import os
@@ -25,7 +12,16 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")  # non-interactive backend so it works on servers
 import matplotlib.pyplot as plt
-import segmentation_models_pytorch as smp
+import sys
+import subprocess
+
+semseg_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../semseg')
+if not os.path.exists(semseg_dir):
+    print(f"Cloning official hszhao/semseg repository to {semseg_dir}...")
+    subprocess.run(["git", "clone", "https://github.com/hszhao/semseg.git", semseg_dir], check=True)
+
+sys.path.append(semseg_dir)
+from model.pspnet import PSPNet as HSZhaoPSPNet
 
 from dataset import get_dataloaders, IGNORE_LABEL, VOC_NUM_CLASSES
 from pspnet_scratch import PSPNetScratch
@@ -37,13 +33,7 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 
 def compute_miou(preds, targets, num_classes, ignore_index=255):
-    """
-    Compute per-class IoU and return the mean (mIoU).
-
-    mIoU is the primary metric used in the PSPNet paper. For each class we
-    calculate intersection / union, then average across classes that actually
-    appear in the batch.
-    """
+    """Computes mean intersection over union (mIoU) for valid pixels."""
     ious = []
     preds = preds.view(-1)
     targets = targets.view(-1)
@@ -65,10 +55,7 @@ def compute_miou(preds, targets, num_classes, ignore_index=255):
 
 
 def compute_pixel_accuracy(preds, targets, ignore_index=255):
-    """
-    Overall pixel accuracy (aAcc) — fraction of correctly classified pixels,
-    excluding ignored pixels.
-    """
+    """fraction of correctly classified valid pixels."""
     valid = targets != ignore_index
     correct = (preds[valid] == targets[valid]).sum().item()
     total = valid.sum().item()
@@ -80,13 +67,7 @@ def compute_pixel_accuracy(preds, targets, ignore_index=255):
 # ---------------------------------------------------------------------------
 
 def make_poly_scheduler(optimizer, total_iters, power=0.9):
-    """
-    Build a poly-decay LR scheduler via LambdaLR.
-
-    The paper decays the learning rate as:
-        lr = base_lr * (1 - current_iter / total_iters) ^ power
-    with power = 0.9.  Using LambdaLR keeps things simple.
-    """
+    """Poly LR schedule: lr = base * (1 - iter/max)^0.9"""
     def _poly_lambda(current_step):
         return (1.0 - current_step / total_iters) ** power
 
@@ -99,17 +80,7 @@ def make_poly_scheduler(optimizer, total_iters, power=0.9):
 
 def train_model(model, train_loader, val_loader, epochs=10, base_lr=0.01,
                 device="cpu", name="model", is_scratch=False):
-    """
-    Train a segmentation model and track loss, pixel accuracy, and mIoU.
-
-    For the scratch model we use:
-      - SGD with momentum and weight decay (matching the paper)
-      - Differential learning rates: backbone at base_lr, heads at 10x
-      - Poly LR decay
-      - Auxiliary loss weighted at 0.4
-
-    For the SMP baseline we use the same optimizer settings for fair comparison.
-    """
+    """Basic train/val loop handling both models' specific structures."""
     model = model.to(device)
     criterion = nn.CrossEntropyLoss(ignore_index=IGNORE_LABEL)
 
@@ -155,14 +126,31 @@ def train_model(model, train_loader, val_loader, epochs=10, base_lr=0.01,
             images, masks = images.to(device), masks.to(device)
 
             optimizer.zero_grad()
-            outputs = model(images)
-
-            # handle auxiliary output from our scratch model
-            if isinstance(outputs, tuple):
-                main_out, aux_out = outputs
-                loss = criterion(main_out, masks) + 0.4 * criterion(aux_out, masks)
+            if hasattr(model, 'zoom_factor') and model.training:
+                # Official hszhao PSPNet
+                B, C, H, W = images.shape
+                sh = ((H - 1) // 8) * 8 + 1
+                sw = ((W - 1) // 8) * 8 + 1
+                if sh != H or sw != W:
+                    # Resize inputs and targets for strict compatibility
+                    im_train = F.interpolate(images, size=(sh, sw), mode="bilinear", align_corners=True)
+                    # Float then nearest interpolate for int targets
+                    m_flt = masks.unsqueeze(1).float()
+                    m_scaled = F.interpolate(m_flt, size=(sh, sw), mode="nearest").squeeze(1).long()
+                else:
+                    im_train, m_scaled = images, masks
+                
+                preds, main_loss, aux_loss = model(im_train, m_scaled)
+                loss = main_loss + 0.4 * aux_loss
             else:
-                loss = criterion(outputs, masks)
+                outputs = model(images)
+
+                # handle auxiliary output from our scratch model
+                if isinstance(outputs, tuple):
+                    main_out, aux_out = outputs
+                    loss = criterion(main_out, masks) + 0.4 * criterion(aux_out, masks)
+                else:
+                    loss = criterion(outputs, masks)
 
             loss.backward()
             optimizer.step()
@@ -181,7 +169,21 @@ def train_model(model, train_loader, val_loader, epochs=10, base_lr=0.01,
         with torch.no_grad():
             for images, masks in val_loader:
                 images, masks = images.to(device), masks.to(device)
-                outputs = model(images)
+                
+                if hasattr(model, 'zoom_factor'):
+                    # hszhao implementation requires shape matching (x-1) % 8 == 0
+                    B, C, H, W = images.shape
+                    sh = ((H - 1) // 8) * 8 + 1
+                    sw = ((W - 1) // 8) * 8 + 1
+                    if sh != H or sw != W:
+                        images = F.interpolate(images, size=(sh, sw), mode="bilinear", align_corners=True)
+                        outputs = model(images)
+                        outputs = F.interpolate(outputs, size=(H, W), mode="bilinear", align_corners=True)
+                    else:
+                        outputs = model(images)
+                else:
+                    outputs = model(images)
+                    
                 val_loss_sum += criterion(outputs, masks).item()
 
                 preds = torch.argmax(outputs, dim=1)
@@ -213,13 +215,7 @@ def train_model(model, train_loader, val_loader, epochs=10, base_lr=0.01,
 # ---------------------------------------------------------------------------
 
 def plot_comparison(hist_scratch, hist_official, epochs, save_path="comparison_plots.png"):
-    """
-    Generate a 2x2 grid comparing scratch vs. official PSPNet:
-      - Training loss
-      - Validation loss
-      - Pixel accuracy
-      - Mean IoU (the paper's primary metric)
-    """
+    """Generates the 2x2 metrics plot."""
     ep = range(1, epochs + 1)
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
@@ -229,7 +225,7 @@ def plot_comparison(hist_scratch, hist_official, epochs, save_path="comparison_p
 
     for ax, title, key, ylabel in zip(axes.flat, titles, keys, ylabels):
         ax.plot(ep, hist_scratch[key], "o-", label="Scratch PSPNet", linewidth=2)
-        ax.plot(ep, hist_official[key], "s--", label="Official (SMP) PSPNet", linewidth=2)
+        ax.plot(ep, hist_official[key], "s--", label="Official (hszhao) PSPNet", linewidth=2)
         ax.set_title(title, fontsize=13)
         ax.set_xlabel("Epoch")
         ax.set_ylabel(ylabel)
@@ -246,10 +242,7 @@ def plot_comparison(hist_scratch, hist_official, epochs, save_path="comparison_p
 
 def visualize_predictions(model_scratch, model_official, val_loader, device,
                           num_samples=4, save_path="qualitative_results.png"):
-    """
-    Show a side-by-side comparison of predictions from both models on a few
-    validation images: [Input | Ground Truth | Scratch Pred | Official Pred]
-    """
+    """Plots side-by-side segmentation visuals."""
     model_scratch.eval()
     model_official.eval()
 
@@ -260,14 +253,25 @@ def visualize_predictions(model_scratch, model_official, val_loader, device,
 
     with torch.no_grad():
         pred_scratch = torch.argmax(model_scratch(images_dev), dim=1).cpu()
-        pred_official = torch.argmax(model_official(images_dev), dim=1).cpu()
+        
+        # Format images for official implementation
+        B, C, H, W = images_dev.shape
+        sh = ((H - 1) // 8) * 8 + 1
+        sw = ((W - 1) // 8) * 8 + 1
+        if sh != H or sw != W:
+            off_images = F.interpolate(images_dev, size=(sh, sw), mode="bilinear", align_corners=True)
+            off_out = model_official(off_images)
+            off_out = F.interpolate(off_out, size=(H, W), mode="bilinear", align_corners=True)
+        else:
+            off_out = model_official(images_dev)
+        pred_official = torch.argmax(off_out, dim=1).cpu()
 
     # un-normalize the images for display
     mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
     fig, axes = plt.subplots(num_samples, 4, figsize=(16, 4 * num_samples))
-    col_titles = ["Input Image", "Ground Truth", "Scratch PSPNet", "Official (SMP)"]
+    col_titles = ["Input Image", "Ground Truth", "Scratch PSPNet", "Official (hszhao)"]
 
     for i in range(num_samples):
         img = images[i] * std + mean
@@ -301,10 +305,7 @@ def visualize_predictions(model_scratch, model_official, val_loader, device,
 
 def multiscale_predict(model, image_batch, num_classes, device,
                        scales=(0.75, 1.0, 1.25), flip=True):
-    """
-    Average predictions across multiple scales (and optional horizontal flip)
-    to boost accuracy at test time, as described in the paper.
-    """
+    """Evaluates images at different scales, averaged."""
     model.eval()
     B, C, H, W = image_batch.shape
     total_logits = torch.zeros(B, num_classes, H, W, device=device)
@@ -312,6 +313,10 @@ def multiscale_predict(model, image_batch, num_classes, device,
     with torch.no_grad():
         for s in scales:
             sh, sw = int(H * s), int(W * s)
+            if hasattr(model, 'zoom_factor'):
+                # Ensure dimensions satisfy (X-1) % 8 == 0 for hszhao's implementation
+                sh = ((sh - 1) // 8) * 8 + 1
+                sw = ((sw - 1) // 8) * 8 + 1
             scaled = F.interpolate(image_batch, size=(sh, sw),
                                    mode="bilinear", align_corners=True)
             out = model(scaled)
@@ -356,7 +361,7 @@ def print_summary_table(hist_scratch, hist_official,
     print("\n" + "=" * 65)
     print("  FINAL METRICS COMPARISON (last epoch)")
     print("=" * 65)
-    header = f"  {'Metric':<22} {'Scratch PSPNet':>18} {'Official (SMP)':>18}"
+    header = f"  {'Metric':<22} {'Scratch PSPNet':>18} {'Official (hszhao)':>18}"
     print(header)
     print("-" * 65)
 
@@ -393,7 +398,7 @@ def main():
     base_lr = 0.01        # paper uses 0.01 as the base learning rate
     num_train = 500       # subset of VOC
     num_val = 100
-    crop_size = 256       # 473 OOMs on 6GB; 256 fits comfortably
+    crop_size = 257       # 473 OOMs on 6GB; 257 fits comfortably and works with hszhao's (x-1)%8 == 0 assert
     num_classes = VOC_NUM_CLASSES  # 21 for PASCAL VOC
 
     # --- prepare data ---
@@ -417,19 +422,22 @@ def main():
     )
 
     # ------------------------------------------------------------------
-    # 2. Train official PSPNet from segmentation-models-pytorch (SMP)
+    # 2. Train official PSPNet by hszhao
     # ------------------------------------------------------------------
-    print("\n>>> Initializing Official (SMP) PSPNet...")
-    model_official = smp.PSPNet(
-        encoder_name="resnet50",
-        encoder_weights="imagenet",
-        in_channels=3,
+    print("\n>>> Initializing Official (hszhao) PSPNet...")
+    model_official = HSZhaoPSPNet(
+        layers=50,
         classes=num_classes,
+        zoom_factor=8,
+        pretrained=False  # To simplify model weights loading handling or set True if supported
     )
+    
+    # We define parameter groups simply if we wanted diff lr, but train_model does it broadly for !is_scratch
+    
     model_official, hist_official = train_model(
         model_official, train_loader, val_loader,
         epochs=epochs, base_lr=base_lr, device=device,
-        name="Official (SMP) PSPNet", is_scratch=False,
+        name="Official (hszhao) PSPNet", is_scratch=False,
     )
 
     # ------------------------------------------------------------------

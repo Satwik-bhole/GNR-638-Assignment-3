@@ -7,14 +7,14 @@
 
 ## Overview
 
-This repository contains a **from-scratch PyTorch implementation** of PSPNet and a comparison against the official implementation provided by the [segmentation-models-pytorch (SMP)](https://github.com/qubvel/segmentation-models-pytorch) library. Both models are trained on a **toy subset of PASCAL VOC 2012** and compared on loss, pixel accuracy, and mean IoU.
+This repository contains a **from-scratch PyTorch implementation** of PSPNet and a comparison against the [official implementation provided by hszhao](https://github.com/hszhao/semseg). Both models are trained on a **toy subset of PASCAL VOC 2012** and compared on loss, pixel accuracy, and mean IoU.
 
 ## Repository Structure
 
 ```
 ├── pspnet_scratch.py   # From-scratch PSPNet (Dilated ResNet-50 + PPM + Aux loss)
 ├── dataset.py          # PASCAL VOC 2012 toy dataset with augmentations
-├── train.py            # Training loop, evaluation, plots, and comparison
+├── train.py            # Training loop, auto-clones official repo, evaluates and plots
 ├── requirements.txt    # Python dependencies
 └── README.md           # This file
 ```
@@ -30,9 +30,9 @@ This repository contains a **from-scratch PyTorch implementation** of PSPNet and
 | **Optimizer** | SGD, momentum=0.9, weight_decay=1e-4 |
 | **LR Schedule** | Poly decay: `lr = base_lr × (1 − iter/max_iter)^0.9` |
 | **Differential LR** | Backbone at base_lr, new heads at 10× base_lr |
-| **Crop Size** | 473×473 (paper's setting for VOC) |
+| **Crop Size** | 257×257 (Modified to fit 6GB VRAM and satisfy (x-1)%8==0 constraint) |
 | **Augmentations** | Random scale [0.5, 2.0], horizontal flip, brightness jitter, Gaussian blur, random crop |
-| **Multi-scale Test** | Scales [0.5, 0.75, 1.0, 1.25, 1.5, 1.75] with horizontal flip |
+| **Multi-scale Test** | Scales [0.75, 1.0, 1.25] with horizontal flip |
 | **Metrics** | Mean IoU (primary), pixel accuracy, loss |
 
 ## How to Run
@@ -50,10 +50,12 @@ python train.py
 ```
 
 This will:
+- Automatically clone the official `hszhao/semseg` repository if not present (`../semseg`)
 - Download PASCAL VOC 2012 (on first run)
-- Train the scratch PSPNet for 30 epochs on 473×473 crops
-- Train the SMP PSPNet for 30 epochs on the same data
-- Run multi-scale inference (scales 0.5–1.75 + flip) on both models
+- Train the scratch PSPNet for 15 epochs on 257×257 crops
+- Train the official hszhao PSPNet for 15 epochs on the same data
+- Display interactive `tqdm` progress bars for training, validation, and multi-scale inference
+- Run multi-scale inference (scales 0.75, 1.0, 1.25 + flip) on both models
 - Save comparison plots to `comparison_plots.png`
 - Save qualitative predictions to `qualitative_results.png`
 - Print a final metrics comparison table (single-scale + multi-scale)
@@ -81,20 +83,20 @@ python dataset.py
 
 ## Scratch vs Official — What's Compared
 
-| Aspect | Scratch | Official (SMP) |
+| Aspect | Scratch | Official (hszhao) |
 |---|---|---|
-| Backbone | Dilated ResNet-50 with deep stem (ImageNet pretrained stages) | ResNet-50 (ImageNet pretrained) |
-| Stem | Three 3×3 convs (paper's modified ResNet) | Standard 7×7 conv |
-| PPM | Custom MultiScalePooling module | SMP's built-in PSP head |
-| Auxiliary loss | Yes (0.4 weight) | No (SMP doesn't include it by default) |
-| Crop size | 473×473 (paper's VOC setting) | Same |
-| Multi-scale test | Yes (0.5–1.75 + flip) | Same |
-| Optimizer | SGD + Poly LR (10× for heads) | SGD + Poly LR (same for fair comparison) |
+| Backbone | Dilated ResNet-50 with deep stem (ImageNet pretrained stages) | Same (Dilated ResNet-50) |
+| Stem | Three 3×3 convs (paper's modified ResNet) | Same (Three 3x3 convs) |
+| PPM | Custom MultiScalePooling module | Official PPM module |
+| Auxiliary loss | Yes (0.4 weight) | Yes (0.4 weight) |
+| Crop size | 257×257 | 257×257 (Matches model dimension assertions) |
+| Multi-scale test | Yes (0.75, 1.0, 1.25 + flip) | Yes |
+| Optimizer | SGD + Poly LR (10× for heads) | SGD + Poly LR |
 | Dataset | VOC 2012 subset (500 train / 100 val) | Same |
 
 ## Notes
 
-- We use a subset of VOC (500 train / 100 val) and 30 epochs to keep training practical while still being large enough for meaningful learning. The paper trains on the full dataset for 50 epochs.
-- The deep stem (three 3×3 convs) matches the paper's modified ResNet. Since torchvision doesn't provide this variant, we build it from scratch and bridge it to the pretrained residual stages with a 1×1 adapter.
-- Multi-scale inference at test time matches the paper's evaluation protocol (scales 0.5–1.75 with horizontal flipping).
-- All comparison is done on the exact same data splits with the same hyperparameters.
+- We use a subset of VOC (500 train / 100 val) and 15 epochs to keep training practical on local hardware with 6GB VRAM.
+- The deep stem in `pspnet_scratch.py` mimics `hszhao`'s codebase. Instead of a 1x1 adapter, it structurally adjusts the first bottleneck block of `layer1` to natively accept 128 input channels.
+- Validation loops employ dynamic interpolation for inputs and target masks to guarantee the official implementation's strict `(x-1) % 8 == 0` dimension checks remain satisfied when arbitrary-sized streaming test batches are evaluated.
+- All comparison is done on the exact same data splits with identical hyperparameters, and visual progress is tracked seamlessly.

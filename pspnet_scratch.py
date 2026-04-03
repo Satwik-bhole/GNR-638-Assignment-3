@@ -150,12 +150,10 @@ class PSPNetScratch(nn.Module):
         # paper-style deep stem: three 3×3 convs (outputs 128 channels)
         self.stem = _DeepStem()
 
-        # bridge from 128-ch stem to 64-ch expected by layer1's first block
-        self.stem_adapter = nn.Sequential(
-            nn.Conv2d(128, 64, kernel_size=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-        )
+        # In hszhao's official implementation, the 128-ch stem output is fed directly 
+        # into layer1 by modifying its first Bottleneck block, rather than using an adapter.
+        backbone.layer1[0].conv1 = nn.Conv2d(128, 64, kernel_size=1, bias=False)
+        backbone.layer1[0].downsample[0] = nn.Conv2d(128, 256, kernel_size=1, bias=False)
 
         # residual stages from the pretrained backbone
         # (stage 3 & 4 already use dilation thanks to replace_stride_with_dilation)
@@ -190,7 +188,7 @@ class PSPNetScratch(nn.Module):
     # ------------------------------------------------------------------
     def _kaiming_init_heads(self):
         """Kaiming-normal init for every conv in our new heads + stem."""
-        modules_to_init = [self.stem, self.stem_adapter,
+        modules_to_init = [self.stem,
                            self.pyramid_pool, self.seg_head]
         if self.use_aux:
             modules_to_init.append(self.aux_head)
@@ -210,9 +208,8 @@ class PSPNetScratch(nn.Module):
     def forward(self, x):
         orig_h, orig_w = x.shape[2], x.shape[3]
 
-        # run the image through the deep stem + adapter + dilated backbone
+        # run the image through the deep stem + dilated backbone
         feat = self.stem(x)
-        feat = self.stem_adapter(feat)
         feat = self.res_stage1(feat)
         feat = self.res_stage2(feat)
         feat_s3 = self.res_stage3(feat)   # kept aside for the aux branch
