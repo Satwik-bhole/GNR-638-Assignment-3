@@ -443,7 +443,7 @@ def main():
     # ------------------------------------------------------------------
     # 3. Multi-scale inference (paper evaluates at multiple scales)
     # ------------------------------------------------------------------
-    print("\n>>> Running multi-scale inference (scales: 0.5–1.75 + flip)...")
+    print("\n>>> Running multi-scale inference (scales: 0.75, 1.0, 1.25 + flip)...")
     ms_scratch = evaluate_with_multiscale(
         model_scratch, val_loader, device, num_classes)
     print(f"  Scratch  MS — Pixel Acc: {ms_scratch[0]:.4f}, mIoU: {ms_scratch[1]:.4f}")

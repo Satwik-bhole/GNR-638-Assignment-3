@@ -86,7 +86,7 @@ Val  : 100 images (50 batches)
 [Official (hszhao) PSPNet] Epoch 15/15 Train: 100%|███████████████████████████████████████████████████████████████████████████████████████| 250/250 [00:42<00:00,  5.86it/s, loss=2.1802]
   Epoch 15/15  Train Loss: 2.0301  |  Val Loss: 3.5503  |  Pixel Acc: 0.7085  |  mIoU: 0.0338
 
->>> Running multi-scale inference (scales: 0.5–1.75 + flip)...
+>>> Running multi-scale inference (scales: 0.75, 1.0, 1.25 + flip)...
   Scratch  MS — Pixel Acc: 0.7095, mIoU: 0.0338
   Official MS — Pixel Acc: 0.7095, mIoU: 0.0338
 
